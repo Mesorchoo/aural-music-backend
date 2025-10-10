@@ -21,6 +21,10 @@ ALLOWED_MUSIC_FILE_EXTENSIONS=".mp3,.flac,.opus"
 - Run server with
 `bun index.js`
 
+- Bundle a single file
+`bun build --target=bun index.js > /srv/music/backend.js`
+
+
 - Create a service so you don't need to manually start it all the time. How to do this depends on your operating system.
 Windows users look for NSSM (non-sucking-service-manager).
 Linux users you probably already know how to do this.

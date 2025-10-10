@@ -1,13 +1,20 @@
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
+console.log(process.env);
 
+const LISTEN_HOST = process.env.LISTEN_HOST || '0.0.0.0';
 const LISTEN_PORT = process.env.LISTEN_PORT;
 const MUSIC_LIBRARY_PATH = process.env.MUSIC_LIBRARY_PATH;
-const ALLOWED_MUSIC_FILE_EXTENSIONS = process.env.ALLOWED_MUSIC_FILE_EXTENSIONS.split(',').map(ext => ext.trim().toLowerCase());
+const ALLOWED_MUSIC_FILE_EXTENSIONS = process.env.ALLOWED_MUSIC_FILE_EXTENSIONS?.split(',').map(ext => ext.trim().toLowerCase());
 const SECURITY_TOKEN = process.env.SECURITY_TOKEN;
 
 // Check environment variables
+if (!LISTEN_HOST) {
+    console.error("Error: LISTEN_HOST environment variable is not set or invalid. See README for details.");
+    process.exit(1);
+}
+
 if (!LISTEN_PORT || isNaN(parseInt(LISTEN_PORT))) {
     console.error("Error: LISTEN_PORT environment variable is not set or invalid. See README for details.");
     process.exit(1);
@@ -40,6 +47,7 @@ function authenticate(request) {
 
 
 const server = Bun.serve({
+    hostname: LISTEN_HOST,
   port: LISTEN_PORT,
 fetch(request) {
     try {
