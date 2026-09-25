@@ -15,6 +15,14 @@ LISTEN_PORT=3000
 MUSIC_LIBRARY_PATH="/srv/music/Library"
 ALLOWED_MUSIC_FILE_EXTENSIONS=".mp3,.flac,.opus"
 
+Optionally set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET (create an app at https://developer.spotify.com/dashboard).
+When set, any album folder without an album_art file will have its art looked up on Spotify during a sync
+and saved as album_art.jpg in the album folder, so it is only fetched once.
+
+To fetch missing album art for the whole library ahead of time (instead of during a sync), run
+`bun index.js --fetch-album-art`
+This only needs MUSIC_LIBRARY_PATH and the Spotify variables set, and exits when finished without starting the server.
+
 - Install dependencies with 
 `bun i`
 
