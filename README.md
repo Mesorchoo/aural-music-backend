@@ -23,6 +23,10 @@ To fetch missing album art for the whole library ahead of time (instead of durin
 `bun index.js --fetch-album-art`
 This only needs MUSIC_LIBRARY_PATH and the Spotify variables set, and exits when finished without starting the server.
 
+Playlists are saved as JSON files (one per playlist, named by its id) in a `.playlists` folder inside MUSIC_LIBRARY_PATH,
+so they're shared between devices and included in any backup of your library. Set PLAYLISTS_PATH to store them somewhere else.
+The backend needs write access to this folder.
+
 - Install dependencies with 
 `bun i`
 
