@@ -547,6 +547,9 @@ async function getTrack(artistName, albumName, trackName, request) {
 
     let type = contentType(trackName);
     if (isMusic) {
+        // Transcoding a long track can take longer than Bun's 10 second idle timeout, which would drop the connection
+        if (TRANSCODE_EXTENSIONS.includes(path.extname(trackName).toLowerCase())) server.timeout(request, 0);
+
         // If ffmpeg fails, fall back to the original file rather than failing the request
         const transcoded = await transcodeIfNeeded(filepath, mtimeMs).catch(err => {
             console.error('Error transcoding', filepath, err.message);
