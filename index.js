@@ -13,8 +13,19 @@ const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET;
 // Hidden folder inside the library by default, so the library scan skips it and it's backed up with the music
 const PLAYLISTS_PATH = process.env.PLAYLISTS_PATH || `${MUSIC_LIBRARY_PATH}/.playlists`;
 
+// Dolby Digital / Digital Plus (used by most Atmos .m4a files) can't be played by Chrome or Firefox,
+// so those files are transcoded once to FLAC, keeping all channels, and the copy is served instead
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
+const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe';
+const TRANSCODE_PATH = process.env.TRANSCODE_PATH || `${MUSIC_LIBRARY_PATH}/.transcoded`;
+const TRANSCODE_CODECS = ['ac3', 'eac3'];
+const TRANSCODE_EXTENSIONS = ['.m4a', '.m4b', '.mp4', '.ac3', '.ec3', '.eac3'];
+
 // `bun index.js --fetch-album-art` fetches missing album art for the whole library, then exits
 const FETCH_ALBUM_ART_ONLY = process.argv.includes('--fetch-album-art');
+// `bun index.js --transcode` transcodes every Dolby file in the library ahead of time, then exits
+const TRANSCODE_ONLY = process.argv.includes('--transcode');
+const CLI_ONLY = FETCH_ALBUM_ART_ONLY || TRANSCODE_ONLY;
 
 // Check environment variables
 if (!LISTEN_HOST) {
@@ -22,7 +33,7 @@ if (!LISTEN_HOST) {
     process.exit(1);
 }
 
-if (!FETCH_ALBUM_ART_ONLY && (!LISTEN_PORT || isNaN(parseInt(LISTEN_PORT)))) {
+if (!CLI_ONLY && (!LISTEN_PORT || isNaN(parseInt(LISTEN_PORT)))) {
     console.error("Error: LISTEN_PORT environment variable is not set or invalid. See README for details.");
     process.exit(1);
 }
@@ -37,7 +48,7 @@ if (!ALLOWED_MUSIC_FILE_EXTENSIONS || ALLOWED_MUSIC_FILE_EXTENSIONS.length === 0
     process.exit(1);
 }
 
-if (!FETCH_ALBUM_ART_ONLY && !SECURITY_TOKEN) {
+if (!CLI_ONLY && !SECURITY_TOKEN) {
     console.error("Error: SECURITY_TOKEN environment variable is not set. See README for details.");
     process.exit(1);
 }
@@ -52,8 +63,19 @@ const spotifyMisses = new Set();
 let spotifyToken = null;
 let spotifyTokenExpires = 0;
 
+// Audio codec of each file, keyed by path and modified time, so each file is only probed once
+const codecCache = new Map();
+let ffprobeMissingLogged = false;
+// Transcodes in progress, keyed by output path, so overlapping requests share one ffmpeg run
+const transcodes = new Map();
+
 if (FETCH_ALBUM_ART_ONLY) {
     await fetchAllAlbumArt();
+    process.exit(0);
+}
+
+if (TRANSCODE_ONLY) {
+    await transcodeLibrary();
     process.exit(0);
 }
 
@@ -263,9 +285,13 @@ async function getAlbumTracks(albumDir, albumEntries) {
         if (!ALLOWED_MUSIC_FILE_EXTENSIONS.includes(path.extname(entry.name).toLowerCase())) continue;
 
         try {
+            const filepath = `${albumDir}/${entry.name}`;
+            const source = await stat(filepath);
+            // Report the size of what's actually served, so the frontend's offline cache check matches
+            const transcoded = await existingTranscode(filepath, source.mtimeMs);
             output.push({
                 track: entry.name,
-                size: (await stat(`${albumDir}/${entry.name}`)).size
+                size: transcoded ? transcoded.size : source.size
             });
         } catch (err) {
             console.error('Cannot read', `${albumDir}/${entry.name}`, err.message);
@@ -354,9 +380,18 @@ const IMAGE_TYPES = {
     '.avif': 'image/avif',
 };
 
+// Audio extensions whose MIME type isn't just audio/{ext}
+const AUDIO_TYPES = {
+    '.m4a': 'audio/mp4',
+    '.m4b': 'audio/mp4',
+    '.mp3': 'audio/mpeg',
+    '.oga': 'audio/ogg',
+    '.opus': 'audio/ogg',
+};
+
 function contentType(fileName) {
     const ext = path.extname(fileName).toLowerCase();
-    return IMAGE_TYPES[ext] || `audio/${ext.replace('.', '')}`;
+    return IMAGE_TYPES[ext] || AUDIO_TYPES[ext] || `audio/${ext.replace('.', '')}`;
 }
 
 // Walk the whole library and fetch art for every album folder that doesn't have any
@@ -383,6 +418,112 @@ async function fetchAllAlbumArt() {
     console.log(`Done. ${saved} saved, ${missing} not found or failed, ${existing} already had art.`);
 }
 
+// Where the transcoded copy of a library file lives, mirroring the library's folders
+function transcodedPath(filepath) {
+    return `${TRANSCODE_PATH}${filepath.slice(MUSIC_LIBRARY_PATH.length)}.flac`;
+}
+
+// The transcoded copy of a file as { file, size }, or null if there isn't one newer than the original
+async function existingTranscode(filepath, sourceMtimeMs) {
+    if (!TRANSCODE_EXTENSIONS.includes(path.extname(filepath).toLowerCase())) return null;
+    const file = transcodedPath(filepath);
+    try {
+        const { size, mtimeMs } = await stat(file);
+        return mtimeMs >= sourceMtimeMs ? { file, size } : null;
+    } catch {
+        return null;
+    }
+}
+
+// Codec name of the file's first audio stream (e.g. 'eac3'), or null if it can't be probed
+async function probeCodec(filepath, mtimeMs) {
+    const key = `${filepath}:${mtimeMs}`;
+    if (codecCache.has(key)) return codecCache.get(key);
+
+    let proc;
+    try {
+        proc = Bun.spawn([FFPROBE_PATH, '-v', 'error', '-select_streams', 'a:0',
+            '-show_entries', 'stream=codec_name', '-of', 'default=noprint_wrappers=1:nokey=1', filepath],
+            { stdout: 'pipe', stderr: 'ignore' });
+    } catch (err) {
+        if (!ffprobeMissingLogged) console.error(`Cannot run ${FFPROBE_PATH}, Dolby files won't be transcoded:`, err.message);
+        ffprobeMissingLogged = true;
+        return null;
+    }
+    const codec = (await new Response(proc.stdout).text()).trim() || null;
+    await proc.exited;
+
+    codecCache.set(key, codec);
+    return codec;
+}
+
+// If the file is Dolby audio, returns its transcoded copy as { file, size }, transcoding it first if needed.
+// Returns null for files that are served as they are.
+async function transcodeIfNeeded(filepath, mtimeMs) {
+    if (!TRANSCODE_EXTENSIONS.includes(path.extname(filepath).toLowerCase())) return null;
+
+    const existing = await existingTranscode(filepath, mtimeMs);
+    if (existing) return existing;
+
+    if (!TRANSCODE_CODECS.includes(await probeCodec(filepath, mtimeMs))) return null;
+
+    const file = transcodedPath(filepath);
+    if (!transcodes.has(file)) {
+        transcodes.set(file, transcode(filepath, file).finally(() => transcodes.delete(file)));
+    }
+    await transcodes.get(file);
+    return { file, size: (await stat(file)).size };
+}
+
+async function transcode(source, dest) {
+    console.log('Transcoding', source);
+    await mkdir(path.dirname(dest), { recursive: true });
+
+    // Write to a temp file then rename, so a failed or interrupted run can't leave a half-written copy.
+    // Only the first audio stream is kept (drops embedded cover art); all its channels are kept.
+    const tmp = `${dest}.tmp`;
+    const proc = Bun.spawn([FFMPEG_PATH, '-nostdin', '-v', 'error', '-y', '-i', source,
+        '-map', '0:a:0', '-map_metadata', '0', '-c:a', 'flac', '-f', 'flac', tmp],
+        { stdout: 'ignore', stderr: 'pipe' });
+    const errors = await new Response(proc.stderr).text();
+
+    if (await proc.exited !== 0) {
+        await unlink(tmp).catch(() => {});
+        throw new Error(`ffmpeg exited with ${proc.exitCode}: ${errors.trim()}`);
+    }
+    await rename(tmp, dest);
+}
+
+// Walk the whole library and transcode every Dolby file that doesn't have a copy yet
+async function transcodeLibrary() {
+    console.log('Transcoding Dolby files in', MUSIC_LIBRARY_PATH);
+    let transcoded = 0, failed = 0;
+
+    for (const artist of libraryFolders(await readDirSafe(MUSIC_LIBRARY_PATH))) {
+        const artistPath = `${MUSIC_LIBRARY_PATH}/${artist.name}`;
+
+        for (const album of libraryFolders(await readDirSafe(artistPath))) {
+            const albumDir = `${artistPath}/${album.name}`;
+
+            for (const entry of await readDirSafe(albumDir)) {
+                if (!entry.isFile()) continue;
+                if (!ALLOWED_MUSIC_FILE_EXTENSIONS.includes(path.extname(entry.name).toLowerCase())) continue;
+                const filepath = `${albumDir}/${entry.name}`;
+                try {
+                    const { mtimeMs } = await stat(filepath);
+                    if (await existingTranscode(filepath, mtimeMs)) continue;
+                    if (await transcodeIfNeeded(filepath, mtimeMs)) transcoded++;
+                } catch (err) {
+                    console.error('Error transcoding', filepath, err.message);
+                    failed++;
+                }
+            }
+        }
+    }
+
+    console.log(`Done. ${transcoded} transcoded, ${failed} failed.`);
+}
+
 async function getTrack(artistName, albumName, trackName, request) {
     const notFound = () => new Response("Not found", { status: 404, headers: CORS_HEADERS });
 
@@ -394,19 +535,33 @@ async function getTrack(artistName, albumName, trackName, request) {
     if ([artistName, albumName, trackName].some(p => p === '.' || p === '..' || /[\\/\0]/.test(p))) {
         return notFound();
     }
-    const filepath = `${MUSIC_LIBRARY_PATH}/${artistName}/${albumName}/${trackName}`;
+    let filepath = `${MUSIC_LIBRARY_PATH}/${artistName}/${albumName}/${trackName}`;
 
-    let size;
+    let size, mtimeMs;
     try {
-        ({ size } = await stat(filepath));
+        ({ size, mtimeMs } = await stat(filepath));
     } catch {
         return notFound();
     }
     console.log('Client downloading', filepath);
 
+    let type = contentType(trackName);
+    if (isMusic) {
+        // If ffmpeg fails, fall back to the original file rather than failing the request
+        const transcoded = await transcodeIfNeeded(filepath, mtimeMs).catch(err => {
+            console.error('Error transcoding', filepath, err.message);
+            return null;
+        });
+        if (transcoded) {
+            filepath = transcoded.file;
+            size = transcoded.size;
+            type = 'audio/flac';
+        }
+    }
+
     const headers = {
         ...CORS_HEADERS,
-        "Content-Type": contentType(trackName),
+        "Content-Type": type,
         "Cache-Control": 'max-age=31536000',
         "Accept-Ranges": "bytes",
     };

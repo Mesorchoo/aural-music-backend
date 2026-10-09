@@ -27,6 +27,18 @@ Playlists are saved as JSON files (one per playlist, named by its id) in a `.pla
 so they're shared between devices and included in any backup of your library. Set PLAYLISTS_PATH to store them somewhere else.
 The backend needs write access to this folder.
 
+Dolby Digital / Dolby Digital Plus (E-AC-3) audio, which most Dolby Atmos .m4a files use, can't be played by Chrome, Brave or Firefox.
+If ffmpeg and ffprobe are installed (on the PATH, or set FFMPEG_PATH and FFPROBE_PATH), these files are transcoded to FLAC
+the first time they're played, keeping all their channels (e.g. 5.1), and the FLAC copy is served from then on.
+Atmos height/object information isn't kept: you get the 5.1 or 7.1 mix underneath it.
+Copies are saved in a `.transcoded` folder inside MUSIC_LIBRARY_PATH (set TRANSCODE_PATH to store them elsewhere), so the backend
+needs write access there. Remember to add .m4a to ALLOWED_MUSIC_FILE_EXTENSIONS.
+
+The first play of each track waits for its transcode, and the frontend only sees the new file size after its next sync.
+To transcode the whole library ahead of time instead, run
+`bun index.js --transcode`
+then sync. This only needs MUSIC_LIBRARY_PATH and ALLOWED_MUSIC_FILE_EXTENSIONS set, and exits when finished without starting the server.
+
 - Install dependencies with 
 `bun i`
 
@@ -51,7 +63,7 @@ The Aural Music frontend supports a few variations on this and strips off the nu
 
 Supported audio formats can be configured in the ALLOWED_MUSIC_FILE_EXTENSIONS environment variable, but must be natively supported by the client.
 In general most modern web browsers will support the usual mp3, flac, opus etc
-No transcoding is performed, if you want this you will need to transcode in advanced or modify the backend code.
+Apart from Dolby files (see above), no transcoding is performed, so other formats need to be converted in advance.
 
 
 eg:
