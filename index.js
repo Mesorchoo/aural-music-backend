@@ -1,4 +1,5 @@
-import { mkdir, readdir, readFile, rename, stat, unlink } from "node:fs/promises";
+import { copyFile, mkdir, readdir, readFile, rename, stat, unlink, utimes } from "node:fs/promises";
+import { availableParallelism } from "node:os";
 import path from "node:path";
 
 console.log(process.env);
@@ -21,11 +22,18 @@ const TRANSCODE_PATH = process.env.TRANSCODE_PATH || `${MUSIC_LIBRARY_PATH}/.tra
 const TRANSCODE_CODECS = ['ac3', 'eac3'];
 const TRANSCODE_EXTENSIONS = ['.m4a', '.m4b', '.mp4', '.ac3', '.ec3', '.eac3'];
 
+// `bun index.js --opus` makes an Opus copy of the whole library and a quality report
+const OPUS_PATH = process.env.OPUS_PATH || `${MUSIC_LIBRARY_PATH}/.opus`;
+const OPUS_BITRATE = parseInt(process.env.OPUS_BITRATE) || 160; // kbps for stereo, scaled for other channel counts
+const OPUS_JOBS = parseInt(process.env.OPUS_JOBS) || availableParallelism();
+
 // `bun index.js --fetch-album-art` fetches missing album art for the whole library, then exits
 const FETCH_ALBUM_ART_ONLY = process.argv.includes('--fetch-album-art');
 // `bun index.js --transcode` transcodes every Dolby file in the library ahead of time, then exits
 const TRANSCODE_ONLY = process.argv.includes('--transcode');
-const CLI_ONLY = FETCH_ALBUM_ART_ONLY || TRANSCODE_ONLY;
+// `bun index.js --opus` transcodes the whole library to Opus and reports on quality issues, then exits
+const OPUS_ONLY = process.argv.includes('--opus');
+const CLI_ONLY = FETCH_ALBUM_ART_ONLY || TRANSCODE_ONLY || OPUS_ONLY;
 
 // Check environment variables
 if (!LISTEN_HOST) {
@@ -76,6 +84,11 @@ if (FETCH_ALBUM_ART_ONLY) {
 
 if (TRANSCODE_ONLY) {
     await transcodeLibrary();
+    process.exit(0);
+}
+
+if (OPUS_ONLY) {
+    await opusLibrary();
     process.exit(0);
 }
 
@@ -522,6 +535,416 @@ async function transcodeLibrary() {
     }
 
     console.log(`Done. ${transcoded} transcoded, ${failed} failed.`);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// --opus: Opus copy of the library + quality report
+// ---------------------------------------------------------------------------------------------------------------
+// Each track is decoded once by ffmpeg, which encodes the Opus copy and measures the audio at the same time.
+// Results are cached (keyed by file size and modified time) in OPUS_PATH, so re-runs only process new or changed files.
+// Note: module-level consts declared below this point aren't initialised yet when --opus runs, so none are used.
+
+function opusAnalysisVersion() { return 1; } // bump to re-analyse everything when the checks change
+
+// Lossless codecs, where the spectrum check can reveal a file made from a lossy one
+function isLosslessCodec(codec) {
+    return /^(flac|alac|ape|wavpack|tta|tak|mlp|truehd|pcm_.*)$/.test(codec || '');
+}
+
+// Bitrate (kbps, for stereo) below which a lossy file is low quality: [bad, warn]
+function lossyBitrateThresholds(codec) {
+    switch (codec) {
+        case 'mp3': return [150, 190];
+        case 'aac': return [120, 150];
+        case 'vorbis': return [112, 150];
+        case 'opus': return [80, 112];
+        default: return [128, 190];
+    }
+}
+
+// Frequency bands (Hz) measured to estimate where the audio is cut off. Lossy encoders throw away everything above
+// a cutoff that depends on bitrate (~16kHz at 96k, ~17kHz at 128k, ~19.5-20kHz at 192-320k), so a sharp drop in
+// level between the reference band and a higher band shows the file was lossy at some point, even if it's now FLAC.
+function opusBands() {
+    return [
+        { id: 'ref', from: 11000, to: 15000 },
+        { id: 'b16', from: 15500, to: 17000 },
+        { id: 'b18', from: 17500, to: 19000 },
+        { id: 'b21', from: 20500, to: 21500 },
+    ];
+}
+
+function relPath(...parts) { return parts.join('/'); }
+
+async function opusLibrary() {
+    const rel = path.relative(MUSIC_LIBRARY_PATH, OPUS_PATH);
+    if (!rel) {
+        console.error('Error: OPUS_PATH must not be MUSIC_LIBRARY_PATH.');
+        process.exit(1);
+    }
+    // Inside the library is fine as long as the scan skips it (hidden or NAS-style folder name)
+    if (!rel.startsWith('..') && !path.isAbsolute(rel) && !/^[.@]/.test(rel.split(/[\\/]/)[0])) {
+        console.error('Error: OPUS_PATH is inside MUSIC_LIBRARY_PATH, so its folder name must start with "." or "@".');
+        process.exit(1);
+    }
+    try {
+        const proc = Bun.spawn([FFMPEG_PATH, '-hide_banner', '-encoders'], { stdout: 'pipe', stderr: 'ignore' });
+        const encoders = await new Response(proc.stdout).text();
+        await proc.exited;
+        if (!/\blibopus\b/.test(encoders)) throw new Error(`${FFMPEG_PATH} has no libopus encoder`);
+        Bun.spawnSync([FFPROBE_PATH, '-version']);
+    } catch (err) {
+        console.error('Error: ffmpeg/ffprobe (with libopus) are needed for --opus:', err.message);
+        process.exit(1);
+    }
+
+    console.log(`Transcoding ${MUSIC_LIBRARY_PATH} to Opus (${OPUS_BITRATE}k stereo) in ${OPUS_PATH}, ${OPUS_JOBS} at a time`);
+    await mkdir(OPUS_PATH, { recursive: true });
+
+    const cacheFile = `${OPUS_PATH}/.quality-cache.json`;
+    let cache = {};
+    try {
+        cache = JSON.parse(await readFile(cacheFile, 'utf8'));
+    } catch { /* first run */ }
+    let unsavedResults = 0;
+    const saveCache = async () => {
+        await Bun.write(`${cacheFile}.tmp`, JSON.stringify(cache));
+        await rename(`${cacheFile}.tmp`, cacheFile);
+        unsavedResults = 0;
+    };
+
+    // Find every track first, so progress can be shown as n/total
+    const tracks = [];
+    const albums = [];
+    for (const artist of libraryFolders(await readDirSafe(MUSIC_LIBRARY_PATH))) {
+        for (const album of libraryFolders(await readDirSafe(`${MUSIC_LIBRARY_PATH}/${artist.name}`))) {
+            const albumRel = relPath(artist.name, album.name);
+            const entries = (await readDirSafe(`${MUSIC_LIBRARY_PATH}/${albumRel}`))
+                .filter(e => e.isFile())
+                .sort((a, b) => a.name.localeCompare(b.name));
+            albums.push({ albumRel, art: entries.filter(e => /^album_art\.[^./]+$/i.test(e.name)).map(e => e.name) });
+
+            // Two formats of the same track would both become the same .opus file: prefer the lossless one
+            const byOutput = new Map();
+            for (const entry of entries) {
+                const ext = path.extname(entry.name).toLowerCase();
+                if (!ALLOWED_MUSIC_FILE_EXTENSIONS.includes(ext)) continue;
+                const outName = `${entry.name.slice(0, -ext.length)}.opus`;
+                const track = { artist: artist.name, album: album.name, track: entry.name, rel: relPath(albumRel, entry.name), outRel: relPath(albumRel, outName) };
+                const other = byOutput.get(outName);
+                if (!other) {
+                    byOutput.set(outName, track);
+                } else if (['.flac', '.wav', '.alac', '.aiff', '.ape', '.wv'].includes(ext)) {
+                    other.duplicateOf = track.track;
+                    byOutput.set(outName, track);
+                    track.duplicates = other;
+                } else {
+                    track.duplicateOf = other.track;
+                    other.duplicates = track;
+                }
+            }
+            tracks.push(...byOutput.values());
+        }
+    }
+    console.log(`Found ${tracks.length} tracks in ${albums.length} albums`);
+
+    let done = 0, encoded = 0, failed = 0;
+    const results = [];
+    await runPool(tracks, OPUS_JOBS, async (track) => {
+        const src = `${MUSIC_LIBRARY_PATH}/${track.rel}`;
+        const dest = `${OPUS_PATH}/${track.outRel}`;
+        let result;
+        try {
+            const { size, mtimeMs } = await stat(src);
+            const destStat = await stat(dest).catch(() => null);
+            const upToDate = destStat && destStat.mtimeMs >= mtimeMs;
+            const cached = cache[track.rel];
+            const cacheValid = cached && cached.size === size && cached.mtimeMs === mtimeMs && cached.version === opusAnalysisVersion();
+
+            if (upToDate && cacheValid) {
+                result = cached;
+            } else {
+                const analysis = await opusTrack(src, upToDate ? null : dest);
+                if (!upToDate) encoded++;
+                result = { size, mtimeMs, version: opusAnalysisVersion(), ...analysis };
+                cache[track.rel] = result;
+                if (++unsavedResults >= 25) await saveCache();
+            }
+        } catch (err) {
+            failed++;
+            result = { error: err.message, info: {}, issues: [{ severity: 'bad', code: 'failed', message: `Could not be transcoded: ${err.message}` }] };
+        }
+
+        const issues = [...result.issues];
+        if (track.duplicates) issues.push({ severity: 'info', code: 'duplicate', message: `Also in the album as ${track.duplicates.track} (skipped)` });
+        results.push({ ...track, info: result.info, issues });
+
+        done++;
+        const worst = worstSeverity(issues);
+        if (result.error) console.error(`[${done}/${tracks.length}] FAILED ${track.rel}: ${result.error}`);
+        else if (worst === 'bad' || worst === 'warn') console.log(`[${done}/${tracks.length}] ${worst.toUpperCase()} ${track.rel}: ${issues.filter(i => i.severity === worst).map(i => i.message).join('; ')}`);
+        else if (done % 50 === 0 || done === tracks.length) console.log(`[${done}/${tracks.length}] ...`);
+    });
+    await saveCache();
+
+    // Copy album art next to the Opus files, so OPUS_PATH works as a complete library
+    for (const { albumRel, art } of albums) {
+        for (const name of art) {
+            const src = `${MUSIC_LIBRARY_PATH}/${albumRel}/${name}`;
+            const dest = `${OPUS_PATH}/${albumRel}/${name}`;
+            try {
+                const [s, d] = await Promise.all([stat(src), stat(dest).catch(() => null)]);
+                if (d && d.mtimeMs >= s.mtimeMs) continue;
+                await mkdir(path.dirname(dest), { recursive: true });
+                await copyFile(src, dest);
+            } catch (err) {
+                console.error('Cannot copy album art', src, err.message);
+            }
+        }
+    }
+
+    const reportFile = await writeQualityReport(results);
+    printQualitySummary(results);
+    console.log(`Done. ${encoded} transcoded, ${tracks.length - encoded - failed} already up to date, ${failed} failed.`);
+    console.log(`Full report: ${reportFile}`);
+}
+
+// Run fn over items, at most `jobs` at a time
+async function runPool(items, jobs, fn) {
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(jobs, items.length)) }, async () => {
+        while (next < items.length) await fn(items[next++]);
+    }));
+}
+
+function severityRank(severity) {
+    return { bad: 3, warn: 2, info: 1 }[severity] || 0;
+}
+
+function worstSeverity(issues) {
+    return issues.reduce((worst, i) => severityRank(i.severity) > severityRank(worst) ? i.severity : worst, 'ok');
+}
+
+async function probeAudio(filepath) {
+    const proc = Bun.spawn([FFPROBE_PATH, '-v', 'error', '-select_streams', 'a:0',
+        '-show_entries', 'stream=codec_name,sample_rate,channels,bit_rate,bits_per_raw_sample,bits_per_sample:format=duration,bit_rate',
+        '-of', 'json', filepath], { stdout: 'pipe', stderr: 'pipe' });
+    const [out, errors] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    await proc.exited;
+    const json = JSON.parse(out || '{}');
+    const stream = json.streams?.[0];
+    if (!stream) throw new Error(errors.trim().split(/\r?\n/).pop()?.replace(`${filepath}: `, '') || 'no audio stream');
+
+    const codec = stream.codec_name;
+    const bitRate = parseInt(stream.bit_rate) || parseInt(json.format?.bit_rate) || 0;
+    return {
+        codec,
+        lossless: isLosslessCodec(codec),
+        sampleRate: parseInt(stream.sample_rate) || 0,
+        channels: parseInt(stream.channels) || 0,
+        bits: parseInt(stream.bits_per_raw_sample) || parseInt(stream.bits_per_sample) || 0,
+        bitrateKbps: Math.round(bitRate / 1000),
+        duration: parseFloat(json.format?.duration) || 0,
+    };
+}
+
+// Transcode one file to Opus at `dest` (or just analyse it if dest is null) and work out its quality issues
+async function opusTrack(src, dest) {
+    const info = await probeAudio(src);
+    const { channels, sampleRate } = info;
+    // Already Opus: keep the original rather than re-encoding it, and only analyse it
+    const copyOnly = dest && info.codec === 'opus' && path.extname(src).toLowerCase() === '.opus';
+    const encode = dest && !copyOnly;
+
+    // Measurements, all from the same decode: overall level/clipping, level in each frequency band, and for stereo
+    // the level of the difference between the channels (silent means both channels are the same)
+    const bands = opusBands().filter(b => b.to < sampleRate / 2 * 0.98);
+    const astats = (name, measures) => `astats@${name}=measure_perchannel=none:measure_overall=${measures}`;
+    const branches = [`${astats('all', 'Peak_level+Peak_count+RMS_level')}`];
+    const monoBranches = bands.map(b =>
+        `firequalizer=gain='if(between(f,${b.from},${b.to}),0,-200)':delay=0.03:wfunc=bharris:fixed=1,${astats(b.id, 'RMS_level')}`);
+    if (channels === 2) branches.push(`pan=mono|c0=0.5*c0-0.5*c1,${astats('side', 'RMS_level')}`);
+
+    const labels = [];
+    const graph = [];
+    const splits = (encode ? 1 : 0) + branches.length + (monoBranches.length ? 1 : 0);
+    graph.push(`[0:a:0]asplit=${splits}${Array.from({ length: splits }, (_, i) => `[s${i}]`).join('')}`);
+    let s = 0;
+    if (encode) {
+        // Opus supports mono, stereo, 5.1 and 7.1; anything else is downmixed to stereo
+        const layout = channels === 6 ? '5.1' : channels === 8 ? '7.1' : channels <= 2 ? null : 'stereo';
+        graph.push(`[s${s++}]${layout ? `aformat=channel_layouts=${layout}` : 'anull'}[enc]`);
+    }
+    for (const branch of branches) {
+        graph.push(`[s${s++}]${branch}[o${labels.length}]`);
+        labels.push(`[o${labels.length}]`);
+    }
+    if (monoBranches.length) {
+        graph.push(`[s${s++}]aformat=sample_fmts=fltp:channel_layouts=mono,asplit=${monoBranches.length}${monoBranches.map((_, i) => `[m${i}]`).join('')}`);
+        monoBranches.forEach((branch, i) => {
+            graph.push(`[m${i}]${branch}[o${labels.length}]`);
+            labels.push(`[o${labels.length}]`);
+        });
+    }
+
+    const args = [FFMPEG_PATH, '-nostdin', '-hide_banner', '-nostats', '-loglevel', 'repeat+level+info', '-y',
+        '-i', src, '-filter_complex', graph.join(';')];
+    const tmp = dest && `${dest}.tmp`;
+    if (dest) await mkdir(path.dirname(dest), { recursive: true });
+    if (encode) {
+        const outChannels = channels === 6 || channels === 8 ? channels : Math.min(channels, 2) || 2;
+        args.push('-map', '[enc]', '-map_metadata', '0', '-map_metadata:s:a:0', '0:s:a:0',
+            '-c:a', 'libopus', '-b:a', `${Math.round(OPUS_BITRATE * outChannels / 2)}k`, '-vbr', 'on', '-compression_level', '10');
+        if (outChannels > 2) args.push('-mapping_family', '1');
+        args.push('-f', 'opus', tmp);
+    }
+    for (const label of labels) args.push('-map', label, '-f', 'null', '-');
+
+    const proc = Bun.spawn(args, { stdout: 'ignore', stderr: 'pipe' });
+    const log = await new Response(proc.stderr).text();
+    if (await proc.exited !== 0) {
+        if (tmp) await unlink(tmp).catch(() => {});
+        const lastError = log.split(/\r?\n/).filter(l => l.includes('[error]') || l.includes('[fatal]')).pop();
+        throw new Error(`ffmpeg exited with ${proc.exitCode}: ${(lastError || log.trim().split(/\r?\n/).pop() || '').replace(/\[[^\]]*\] /g, '')}`);
+    }
+    if (copyOnly) {
+        await copyFile(src, tmp);
+        // copyFile can keep the source's modified time; the up to date check needs it to be newer
+        const now = new Date();
+        await utimes(tmp, now, now);
+    }
+    if (dest) await rename(tmp, dest);
+
+    // Parse "[astats@name @ 0x...] [info] RMS level dB: -45.9" lines
+    const stats = {};
+    for (const m of log.matchAll(/\[astats@(\w+) @ [^\]]*\] \[info\] ([^:\r\n]+): (\S+)/g)) {
+        const value = m[3] === '-inf' ? -Infinity : m[3] === 'inf' ? Infinity : parseFloat(m[3]);
+        (stats[m[1]] ??= {})[m[2]] = value;
+    }
+    const decodeErrors = log.split(/\r?\n/).filter(l => l.includes('[error]')).length;
+
+    return analyseQuality(info, stats, bands, decodeErrors);
+}
+
+function analyseQuality(info, stats, bands, decodeErrors) {
+    const issues = [];
+    const add = (severity, code, message) => issues.push({ severity, code, message });
+    const { codec, lossless, sampleRate, channels, bits, bitrateKbps, duration } = info;
+
+    if (decodeErrors >= 10) add('bad', 'corrupt', `${decodeErrors} decoding errors, the file is probably damaged`);
+    else if (decodeErrors > 0) add('warn', 'decode-errors', `${decodeErrors} decoding error${decodeErrors > 1 ? 's' : ''}`);
+
+    if (sampleRate && sampleRate < 44100) add('bad', 'sample-rate', `Low sample rate (${sampleRate / 1000} kHz)`);
+    if (lossless && bits && bits < 16) add('bad', 'bit-depth', `Low bit depth (${bits} bit)`);
+
+    if (!lossless && bitrateKbps) {
+        // Thresholds are for stereo; mono needs about half the bitrate, surround more
+        const scale = Math.max(channels, 1) / 2;
+        const [bad, warn] = lossyBitrateThresholds(codec).map(t => t * scale);
+        if (bitrateKbps < bad) add('bad', 'bitrate', `Low bitrate ${codec} (${bitrateKbps} kbps)`);
+        else if (bitrateKbps < warn) add('warn', 'bitrate', `Lowish bitrate ${codec} (${bitrateKbps} kbps)`);
+    }
+
+    // Bandwidth: a band is "cut" if it's 40dB+ below the reference band. If the reference band itself is very quiet
+    // (dull or lo-fi recordings, or near silence) there's not enough there to tell.
+    info.bandwidth = 'unknown';
+    const ref = stats.ref?.['RMS level dB'];
+    if (ref !== undefined && ref > -80) {
+        const cut = id => {
+            const level = stats[id]?.['RMS level dB'];
+            return level !== undefined && ref - level >= 40;
+        };
+        const has = id => bands.some(b => b.id === id);
+        if (has('b16') && cut('b16')) info.bandwidth = '<16 kHz';
+        else if (has('b18') && cut('b18')) info.bandwidth = '~17 kHz';
+        else if (has('b21') && cut('b21')) info.bandwidth = '~20 kHz';
+        else if (has('b21')) info.bandwidth = 'full';
+
+        if (info.bandwidth === '<16 kHz') {
+            add('bad', 'bandwidth', lossless
+                ? `Lossless file but audio stops below 16 kHz: made from a low bitrate lossy file`
+                : `Audio stops below 16 kHz (very low bitrate encode)`);
+        } else if (info.bandwidth === '~17 kHz') {
+            if (lossless) add('bad', 'fake-lossless', `Lossless file but audio stops at ~17 kHz: made from a ~128 kbps lossy file`);
+            else if (!issues.some(i => i.code === 'bitrate' && i.severity === 'bad')) add('warn', 'bandwidth', `Audio stops at ~17 kHz, typical of ~128 kbps encodes`);
+        } else if (info.bandwidth === '~20 kHz' && lossless) {
+            add('info', 'fake-lossless', `Lossless file but audio stops at ~20 kHz: probably made from a high bitrate lossy file`);
+        }
+    }
+
+    const all = stats.all || {};
+    if (channels === 1) add('warn', 'mono', 'Mono');
+    else if (channels === 2 && stats.side && all['RMS level dB'] > -60 && all['RMS level dB'] - stats.side['RMS level dB'] > 50) {
+        add('info', 'fake-stereo', 'Both channels are identical (mono recording)');
+    }
+
+    // Clipping: the track keeps hitting full scale. Peak count counts runs at the peak level, not samples.
+    const peakRuns = all['Peak count'] || 0;
+    const minutes = duration / 60;
+    if (all['Peak level dB'] >= -0.1 && minutes > 0 && peakRuns / minutes >= 30) {
+        add('warn', 'clipping', `Clipping (hits full scale ${Math.round(peakRuns / minutes)} times a minute)`);
+    }
+
+    if (all['RMS level dB'] !== undefined && all['RMS level dB'] < -60 && duration > 5) add('warn', 'quiet', `Very quiet or silent (${all['RMS level dB'].toFixed(0)} dB RMS)`);
+
+    return { info, issues };
+}
+
+function csvField(value) {
+    const s = String(value ?? '');
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+// Every track, worst first, so it can be sorted and filtered in a spreadsheet
+async function writeQualityReport(results) {
+    const rows = results
+        .map(r => ({ ...r, severity: worstSeverity(r.issues) }))
+        .sort((a, b) => severityRank(b.severity) - severityRank(a.severity) || a.rel.localeCompare(b.rel));
+    const header = ['Severity', 'Artist', 'Album', 'Track', 'Codec', 'Lossless', 'Bitrate kbps', 'Sample rate', 'Bits', 'Channels', 'Bandwidth', 'Issues'];
+    const lines = [header.join(',')];
+    for (const r of rows) {
+        const i = r.info || {};
+        lines.push([r.severity, r.artist, r.album, r.track, i.codec, i.lossless ? 'yes' : i.codec ? 'no' : '',
+            i.lossless ? '' : i.bitrateKbps, i.sampleRate, i.bits || '', i.channels, i.bandwidth,
+            r.issues.map(x => `${x.severity}: ${x.message}`).join('; ')].map(csvField).join(','));
+    }
+    const file = `${OPUS_PATH}/quality-report.csv`;
+    // BOM so Excel opens it as UTF-8
+    await Bun.write(file, '﻿' + lines.join('\r\n') + '\r\n');
+    return file;
+}
+
+// Albums with low quality tracks, worst first, as replacing a whole album is usually what you'd do
+function printQualitySummary(results) {
+    const counts = { bad: 0, warn: 0, info: 0, ok: 0 };
+    const albums = new Map();
+    for (const r of results) {
+        const severity = worstSeverity(r.issues);
+        counts[severity]++;
+        if (severity !== 'bad' && severity !== 'warn') continue;
+        const key = relPath(r.artist, r.album);
+        if (!albums.has(key)) albums.set(key, { key, total: 0, bad: 0, warn: 0, reasons: new Map() });
+        const album = albums.get(key);
+        album[severity]++;
+        for (const issue of r.issues.filter(i => i.severity === severity)) {
+            album.reasons.set(issue.code, (album.reasons.get(issue.code) || 0) + 1);
+        }
+    }
+    for (const r of results) {
+        const album = albums.get(relPath(r.artist, r.album));
+        if (album) album.total++;
+    }
+
+    console.log('');
+    console.log(`Quality: ${counts.bad} bad, ${counts.warn} warning, ${counts.info} info, ${counts.ok} ok`);
+    if (albums.size === 0) return;
+    console.log('Albums with low quality tracks:');
+    const sorted = [...albums.values()].sort((a, b) => b.bad / b.total - a.bad / a.total || b.warn / b.total - a.warn / a.total || a.key.localeCompare(b.key));
+    for (const a of sorted) {
+        const reasons = [...a.reasons].sort((x, y) => y[1] - x[1]).map(([code, n]) => `${code} x${n}`).join(', ');
+        const parts = [a.bad && `${a.bad} bad`, a.warn && `${a.warn} warn`].filter(Boolean).join(', ');
+        console.log(`  ${a.key}: ${parts} of ${a.total} (${reasons})`);
+    }
 }
 
 async function getTrack(artistName, albumName, trackName, request) {

@@ -39,6 +39,43 @@ To transcode the whole library ahead of time instead, run
 `bun index.js --transcode`
 then sync. This only needs MUSIC_LIBRARY_PATH and ALLOWED_MUSIC_FILE_EXTENSIONS set, and exits when finished without starting the server.
 
+
+### Opus copy of the library and quality report
+
+`bun index.js --opus`
+
+Transcodes every track into an Opus copy of the library, and checks each track for quality problems so poor copies can be found and replaced.
+It needs ffmpeg and ffprobe (with libopus), only needs MUSIC_LIBRARY_PATH and ALLOWED_MUSIC_FILE_EXTENSIONS set, and exits when finished without starting the server.
+
+- The copy goes in a `.opus` folder inside MUSIC_LIBRARY_PATH (set OPUS_PATH to put it elsewhere), with the same Artist/Album folders and album art,
+  so it can be used as a library itself by pointing MUSIC_LIBRARY_PATH at it (remember to add .opus to ALLOWED_MUSIC_FILE_EXTENSIONS).
+  The originals are never changed.
+- OPUS_BITRATE sets the bitrate in kbps for stereo (default 160). Mono gets half, 5.1 and 7.1 (e.g. Dolby files) keep their channels and get proportionally more.
+- Files that are already .opus are copied, not re-encoded. If an album has the same track in two formats, the lossless one is used.
+- Tracks are processed OPUS_JOBS at a time (default: one per CPU core). Each track is decoded once, for both the transcode and the checks.
+- Re-running only processes new or changed tracks (results are cached in `.quality-cache.json`), so it's quick to run again after replacing albums.
+
+The report is written to `quality-report.csv` in the Opus folder, one row per track, worst first, and albums with problems are listed at the end of the output.
+Each problem is rated **bad** (worth replacing), **warn** (worth a look) or **info**:
+
+| Check | Rating |
+|---|---|
+| Lossless (e.g. FLAC) file whose audio stops at ~16-17 kHz, i.e. it was made from a low bitrate MP3/AAC | bad |
+| Lossless file whose audio stops at ~20 kHz (probably from a high bitrate lossy file, or a band-limited master) | info |
+| Lossy file with low bitrate (MP3 under 150k, AAC under 120k, Vorbis under 112k, Opus under 80k, for stereo) | bad |
+| Lossy file with lowish bitrate (MP3 under 190k, AAC/Vorbis under 150k, Opus under 112k) | warn |
+| Lossy file whose audio stops at ~17 kHz | warn |
+| Sample rate under 44.1 kHz, or lossless under 16 bit | bad |
+| Decoding errors (10 or more: bad, as the file is probably damaged) | warn |
+| File can't be decoded at all | bad |
+| Mono | warn |
+| Clipping (keeps hitting full scale) | warn |
+| Very quiet or silent | warn |
+| Stereo file with both channels identical | info |
+
+The cut-off checks compare the level of the 11-15 kHz band with higher bands: lossy encoders remove everything above a cut-off that depends on the bitrate,
+leaving a sharp cliff that's still there after converting to FLAC. Quiet or very dull recordings don't have enough high frequency content to tell, and show "unknown" bandwidth.
+
 - Install dependencies with 
 `bun i`
 
